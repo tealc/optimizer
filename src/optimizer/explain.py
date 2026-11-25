@@ -361,7 +361,7 @@ def configured(settings):
 
 def explain(payload, settings):
     """Explain a plan in the payload's language. Returns the markdown text and the token usage."""
-    language = payload.get('language') or 'en'
+    language = settings.explain_language or payload.get('language') or 'en'
     messages = [
         {'role': 'system', 'content': f'{SYSTEM_PROMPT}\nAnswer in the language with IETF tag {language}.'},
         {'role': 'user', 'content': f'Explain this plan.\n\n{digest(payload)}'},

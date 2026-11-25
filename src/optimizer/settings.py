@@ -49,6 +49,9 @@ class OptimizerSettings(BaseSettings):
     anthropic_api_key: str | None = Field(default=None,
                                           description="API key of the Claude API. When set, /optimize/explain asks Claude instead of Azure OpenAI")
     anthropic_model: str = Field(default="claude-haiku-5-5", description="Claude model behind /optimize/explain")
+    explain_language: str | None = Field(default=None,
+                                         description="IETF language tag the plan explanations are written in, such as de. Unset follows the "
+                                                     "language of the request")
     feedback_table_endpoint: str | None = Field(default=None,
                                                 description="Azure table service the explanations and the votes on them are stored in, "
                                                             "such as https://name.table.core.windows.net, accessed with the managed identity. "

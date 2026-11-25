@@ -242,3 +242,22 @@ def test_explain_without_the_anthropic_key_uses_azure(payload, configured, monke
     monkeypatch.setattr(explain, 'chat', lambda _settings, _messages: ('azure answer', {}))
 
     assert explain.explain(payload, settings)[0] == 'azure answer'
+
+
+@pytest.mark.parametrize('request_language, expected', [('en', 'de'), (None, 'de')])
+def test_explain_language_setting_overrides_the_request(payload, configured, monkeypatch, request_language, expected):
+    seen = {}
+
+    def fake_chat(_settings, messages):
+        seen['system'] = messages[0]['content']
+        return 'ok', {}
+
+    monkeypatch.setattr(explain, 'chat', fake_chat)
+    monkeypatch.setattr(settings, 'explain_language', 'de')
+    if request_language:
+        payload['language'] = request_language
+    else:
+        del payload['language']
+
+    assert app.test_client().post('/optimize/explain', json=payload).status_code == 200
+    assert seen['system'].endswith(f'\nAnswer in the language with IETF tag {expected}.')
