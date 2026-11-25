@@ -313,6 +313,52 @@ def chat(settings, messages):
         raise ExplainError('model returned no answer') from e
 
 
+def claude_chat(settings, messages):
+    """One request against the Anthropic Messages API. Takes the same messages as chat() and returns the text and
+    the usage, with total_tokens as chat() reports it."""
+    system = [{'type': 'text', 'text': m['content'], 'cache_control': {'type': 'ephemeral'}} for m in messages if m['role'] == 'system']
+    body = {
+        'model': settings.anthropic_model,
+        'max_tokens': 1500,
+        # thinking is on by default on current models and eats the token budget: the plan is a table to read, not a puzzle
+        'thinking': {'type': 'disabled'},
+        'output_config': {'effort': 'low'},
+        # the system prompt is the same for every request: let the API cache it
+        'system': system,
+        'messages': [m for m in messages if m['role'] != 'system'],
+    }
+    request = urllib.request.Request(
+        'https://api.anthropic.com/v1/messages',
+        data=json.dumps(body).encode(),
+        headers={'x-api-key': settings.anthropic_api_key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors='replace')[:200]
+        raise ExplainError(f'model returned {e.code}: {detail}') from e
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        raise ExplainError(f'model unreachable: {e}') from e
+
+    try:
+        text = ''.join(block['text'] for block in data['content'] if block['type'] == 'text')
+        usage = data.get('usage') or {}
+    except (KeyError, TypeError) as e:
+        raise ExplainError('model returned no answer') from e
+    if not text.strip():
+        kinds = ','.join(str(b.get('type')) for b in data['content'] if isinstance(b, dict))
+        raise ExplainError(f"model returned no answer (stop_reason {data.get('stop_reason')}, blocks [{kinds}])")
+    counts = [usage.get(k) or 0 for k in ('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens')]
+    return text, {**usage, 'total_tokens': sum(counts)}
+
+
+def configured(settings):
+    """Whether a model is set up to explain plans: Claude with its key, else Azure OpenAI."""
+    return bool(settings.anthropic_api_key or (settings.azure_openai_endpoint and settings.azure_openai_key))
+
+
 def explain(payload, settings):
     """Explain a plan in the payload's language. Returns the markdown text and the token usage."""
     language = payload.get('language') or 'en'
@@ -320,6 +366,6 @@ def explain(payload, settings):
         {'role': 'system', 'content': f'{SYSTEM_PROMPT}\nAnswer in the language with IETF tag {language}.'},
         {'role': 'user', 'content': f'Explain this plan.\n\n{digest(payload)}'},
     ]
-    text, usage = chat(settings, messages)
+    text, usage = (claude_chat if settings.anthropic_api_key else chat)(settings, messages)
     # the prompt forbids dashes, models still slip one in now and then
     return text.replace(' — ', ', ').replace('—', ', ').replace('–', '-'), usage

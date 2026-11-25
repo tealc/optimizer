@@ -19,6 +19,9 @@ The work spans two forks: this optimizer and the evcc fork (`tealc/evcc`, branch
    - Without the fields the model behaves exactly like upstream.
    - Consumer: the evcc fork (`tealc/evcc`, branch `custom`) sends these fields when a vehicle has absence windows.
 2. `chore: fork image build and agent notes`: `.github/workflows/fork-image.yml` and this file.
+3. `feat: explain plans with the Claude API`
+   - `OPTIMIZER_ANTHROPIC_API_KEY` (and `OPTIMIZER_ANTHROPIC_MODEL`, default `claude-haiku-5-5`) switch `/optimize/explain` from Azure OpenAI to the Anthropic Messages API. Without the key Azure is used as upstream.
+   - Touches `src/optimizer/explain.py` (`claude_chat()`, `configured()`), `settings.py`, `app.py`, `README.md`, tests in `tests/test_explain.py`.
 
 Keep fork commits few and focused, so rebasing stays cheap. New fork work gets its own commit. Fixes to an existing fork feature are folded into that commit: `git commit --fixup=<sha>`, then `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash upstream/main`.
 

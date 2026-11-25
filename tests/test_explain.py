@@ -1,3 +1,7 @@
+import io
+import json
+import urllib.error
+
 import pytest
 
 from optimizer import explain
@@ -142,3 +146,99 @@ def test_explain_unconfigured_is_503(payload):
     response = app.test_client().post('/optimize/explain', json=payload)
 
     assert response.status_code == 503
+
+
+class FakeResponse:
+    def __init__(self, data):
+        self.data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self, *_):
+        return json.dumps(self.data).encode()
+
+
+@pytest.fixture
+def claude(monkeypatch):
+    monkeypatch.setattr(settings, 'anthropic_api_key', 'sk-test')
+    monkeypatch.setattr(settings, 'anthropic_model', 'claude-haiku-5-5')
+
+
+MESSAGES = [{'role': 'system', 'content': 'be brief'}, {'role': 'user', 'content': 'why?'}]
+
+
+def test_claude_chat_sends_a_messages_request(claude, monkeypatch):
+    seen = {}
+
+    def fake_urlopen(request, timeout):
+        seen['request'], seen['timeout'] = request, timeout
+        return FakeResponse({'content': [{'type': 'thinking', 'thinking': 'hm'}, {'type': 'text', 'text': 'Because '}, {'type': 'text', 'text': 'cheap.'}],
+                             'usage': {'input_tokens': 100, 'output_tokens': 20, 'cache_read_input_tokens': 5}})
+
+    monkeypatch.setattr(explain.urllib.request, 'urlopen', fake_urlopen)
+    text, usage = explain.claude_chat(settings, MESSAGES)
+
+    request = seen['request']
+    body = json.loads(request.data)
+    assert text == 'Because cheap.'
+    assert usage['total_tokens'] == 125
+    assert request.full_url == 'https://api.anthropic.com/v1/messages'
+    assert request.get_method() == 'POST'
+    assert request.get_header('X-api-key') == 'sk-test'
+    assert request.get_header('Anthropic-version') == '2023-06-01'
+    assert request.get_header('Content-type') == 'application/json'
+    assert body['model'] == 'claude-haiku-5-5'
+    assert body['max_tokens'] == 1500
+    assert body['thinking'] == {'type': 'disabled'}
+    assert body['output_config'] == {'effort': 'low'}
+    assert body['system'] == [{'type': 'text', 'text': 'be brief', 'cache_control': {'type': 'ephemeral'}}]
+    assert body['messages'] == [{'role': 'user', 'content': 'why?'}]
+
+
+def test_claude_chat_reports_http_errors(claude, monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 429, 'Too Many Requests', {}, io.BytesIO(b'slow down'))
+
+    monkeypatch.setattr(explain.urllib.request, 'urlopen', fake_urlopen)
+    with pytest.raises(explain.ExplainError, match='model returned 429: slow down'):
+        explain.claude_chat(settings, MESSAGES)
+
+
+def test_claude_chat_reports_timeouts(claude, monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise TimeoutError('timed out')
+
+    monkeypatch.setattr(explain.urllib.request, 'urlopen', fake_urlopen)
+    with pytest.raises(explain.ExplainError, match='model unreachable'):
+        explain.claude_chat(settings, MESSAGES)
+
+
+@pytest.mark.parametrize('content', [[], [{'type': 'text', 'text': '  '}], [{'type': 'thinking', 'thinking': 'hm'}]])
+def test_claude_chat_reports_an_empty_answer(claude, monkeypatch, content):
+    monkeypatch.setattr(explain.urllib.request, 'urlopen', lambda request, timeout: FakeResponse({'content': content, 'stop_reason': 'max_tokens'}))
+    with pytest.raises(explain.ExplainError, match=r'no answer \(stop_reason max_tokens, blocks \['):
+        explain.claude_chat(settings, MESSAGES)
+
+
+def test_explain_with_only_the_anthropic_key_answers_through_claude(payload, claude, monkeypatch, capsys):
+    monkeypatch.setattr(explain, 'chat', lambda *_: pytest.fail('azure must not be used'))
+    monkeypatch.setattr(explain.urllib.request, 'urlopen', lambda request, timeout: FakeResponse(
+        {'content': [{'type': 'text', 'text': 'Cheap at 10:30.'}], 'usage': {'input_tokens': 10, 'output_tokens': 4}}))
+
+    response = app.test_client().post('/optimize/explain', json=payload)
+
+    assert response.status_code == 200, response.json
+    assert response.json['explanation'] == 'Cheap at 10:30.'
+    assert '"tokens": 14' in capsys.readouterr().out
+
+
+def test_explain_without_the_anthropic_key_uses_azure(payload, configured, monkeypatch):
+    monkeypatch.setattr(settings, 'anthropic_api_key', None)
+    monkeypatch.setattr(explain, 'claude_chat', lambda *_: pytest.fail('claude must not be used'))
+    monkeypatch.setattr(explain, 'chat', lambda _settings, _messages: ('azure answer', {}))
+
+    assert explain.explain(payload, settings)[0] == 'azure answer'
