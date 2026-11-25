@@ -366,6 +366,11 @@ def explain(payload, settings):
         {'role': 'system', 'content': f'{SYSTEM_PROMPT}\nAnswer in the language with IETF tag {language}.'},
         {'role': 'user', 'content': f'Explain this plan.\n\n{digest(payload)}'},
     ]
-    text, usage = (claude_chat if settings.anthropic_api_key else chat)(settings, messages)
+    if settings.anthropic_api_key:
+        # the plan and the prompt are English, a small model follows them there unless the language is the last thing it reads
+        messages[1]['content'] += f'\n\nWrite your whole answer in the language with IETF tag {language}, not in English.'
+        text, usage = claude_chat(settings, messages)
+    else:
+        text, usage = chat(settings, messages)
     # the prompt forbids dashes, models still slip one in now and then
     return text.replace(' — ', ', ').replace('—', ', ').replace('–', '-'), usage

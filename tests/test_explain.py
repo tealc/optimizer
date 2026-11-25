@@ -261,3 +261,18 @@ def test_explain_language_setting_overrides_the_request(payload, configured, mon
 
     assert app.test_client().post('/optimize/explain', json=payload).status_code == 200
     assert seen['system'].endswith(f'\nAnswer in the language with IETF tag {expected}.')
+
+
+def test_claude_gets_the_language_as_the_last_line_azure_does_not(payload, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(explain, 'claude_chat', lambda _settings, messages: (seen.setdefault('claude', messages), ('ok', {}))[1])
+    monkeypatch.setattr(explain, 'chat', lambda _settings, messages: (seen.setdefault('azure', messages), ('ok', {}))[1])
+    monkeypatch.setattr(settings, 'explain_language', None)
+
+    monkeypatch.setattr(settings, 'anthropic_api_key', 'sk-test')
+    explain.explain(payload, settings)
+    monkeypatch.setattr(settings, 'anthropic_api_key', None)
+    explain.explain(payload, settings)
+
+    assert seen['claude'][1]['content'].endswith('Write your whole answer in the language with IETF tag de, not in English.')
+    assert 'Write your whole answer' not in seen['azure'][1]['content']
