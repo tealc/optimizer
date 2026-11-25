@@ -355,6 +355,27 @@ components:
             minimum: 0
           description: Goal state of charge for this battery at each time step (Wh)
           example: [0, 0, 40000, 0, 0, 0]
+        c_avail:
+          type: array
+          items:
+            type: number
+            minimum: 0
+            maximum: 1
+          description: |
+            Availability of the device per time step, 1 = available, 0 = away. While away the
+            device neither charges nor discharges, and s_min, s_max, s_goal and p_demand do not apply.
+            If not specified the device is available in every step.
+          example: [1, 0, 0, 0, 1, 1]
+        e_away:
+          type: array
+          items:
+            type: number
+            minimum: 0
+          description: |
+            Energy the device uses away from the charger per time step (Wh), for example driving.
+            It is taken from the state of charge. Energy the battery cannot hold is reported as a
+            penalised shortfall instead of making the request infeasible. If not specified it is 0.
+          example: [0, 2000, 2000, 2000, 0, 0]
         c_priority:
           type: integer
           minimum: 0

@@ -221,6 +221,10 @@ def battery_line(bat, detail, i, labels, capacity, charged=0):
     facts += [f'charging goal {kwh(goal - bat["s_initial"]) + " kWh more" if unknown else pct(goal)} by {labels[t + 1]}'
               for t, goal in enumerate(bat.get('s_goal') or []) if goal > 0]
     facts += [f'must charge {run}' for run in ranges(bat.get('p_demand'), labels)]
+    if bat.get('c_avail') is not None:
+        facts += [f'away {run}' for run in ranges([1 - a for a in bat['c_avail']], labels)]
+    if sum(bat.get('e_away') or []) > 0:
+        facts.append(f"uses {kwh(sum(bat['e_away']))} kWh while away")
     return title, f'{kind} "{title}": ' + ', '.join(facts)
 
 

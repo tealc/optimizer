@@ -191,6 +191,9 @@ battery_config_model = api.model('BatteryConfig', {
     's_initial': fields.Float(required=True, min=0, description='Initial state of charge (Wh)'),
     'p_demand': fields.List(fields.Float, required=False, description='Minimum charge demand per time step (Wh)'),
     's_goal': fields.List(fields.Float, required=False, description='Goal state of charge at each time step (Wh)'),
+    'c_avail': fields.List(fields.Float, required=False,
+                           description='Availability per time step, 1 = available, 0 = away: no charging or discharging, no SoC limits, goals or demand'),
+    'e_away': fields.List(fields.Float, required=False, description='Energy the device uses away from the charger per time step (Wh)'),
     'c_min': fields.Float(required=True, min=0, description='Minimum charge power (W)'),
     'c_max': fields.Float(required=True, min=0, description='Maximum charge power (W)'),
     'c_active': fields.Boolean(required=False, description='Whether the device is charging at the start of the time horizon.'),
@@ -266,6 +269,25 @@ optimization_result_model = api.model('OptimizationResult', {
 })
 
 
+def check_batteries(batteries):
+    """Reject per battery input the model cannot make sense of, naming the field."""
+    # contradictory limits came back as a bare Infeasible with nothing naming the battery:
+    # c_min above c_max can never charge, s_initial above s_capacity has no state to start from
+    for i, bat in enumerate(batteries):
+        if bat.c_min > bat.c_max:
+            api.abort(400, "Minimum charge power must not exceed maximum charge power",
+                      details={f'batteries.{i}.c_min': f'{bat.c_min} exceeds c_max {bat.c_max}'})
+        if bat.c_avail is not None and any(a not in (0, 1) for a in bat.c_avail):
+            api.abort(400, "Availability must be 0 or 1 per time step",
+                      details={f'batteries.{i}.c_avail': 'values other than 0 and 1'})
+        if bat.e_away is not None and any(e < 0 for e in bat.e_away):
+            api.abort(400, "Energy used away must not be negative",
+                      details={f'batteries.{i}.e_away': 'negative values'})
+        if bat.s_initial > bat.s_capacity:
+            api.abort(400, "Initial state of charge must not exceed capacity",
+                      details={f'batteries.{i}.s_initial': f'{bat.s_initial} exceeds s_capacity {bat.s_capacity}'})
+
+
 @ns.route('/charge-schedule')
 class OptimizeCharging(Resource):
     @api.expect(optimization_input_model, validate=True)
@@ -315,6 +337,8 @@ class OptimizeCharging(Resource):
                     d_max=bat_data['d_max'],
                     p_a=bat_data['p_a'],
                     c_priority=bat_data.get('c_priority', 0),
+                    c_avail=bat_data.get('c_avail'),
+                    e_away=bat_data.get('e_away'),
                 ))
 
             circuits = [CircuitConfig(p_max=c['p_max'], batteries=c['batteries']) for c in data.get('circuits', [])]
@@ -350,23 +374,20 @@ class OptimizeCharging(Resource):
                 'p_demand': [len(bat.p_demand) for bat in batteries if bat.p_demand is not None],
                 's_goal': [len(bat.s_goal) for bat in batteries if bat.s_goal is not None],
             }
+            # listed only when sent, so a request without availability gets the answer it always got
+            for key in ('c_avail', 'e_away'):
+                if sent := [len(getattr(bat, key)) for bat in batteries if getattr(bat, key) is not None]:
+                    lengths[key] = sent
+            per_battery = ('p_demand', 's_goal', 'c_avail', 'e_away')
 
-            if len({*[v for k, v in lengths.items() if k not in ('p_demand', 's_goal')],
-                    *lengths['p_demand'], *lengths['s_goal']}) > 1:
+            if len({*[v for k, v in lengths.items() if k not in per_battery],
+                    *[n for k in per_battery for n in lengths.get(k, [])]}) > 1:
                 api.abort(400, "All time series must have the same length", lengths=lengths)
 
             if lengths['dt'] == 0:
                 api.abort(400, "Time series must not be empty")
 
-            # contradictory limits came back as a bare Infeasible with nothing naming the battery:
-            # c_min above c_max can never charge, s_initial above s_capacity has no state to start from
-            for i, bat in enumerate(batteries):
-                if bat.c_min > bat.c_max:
-                    api.abort(400, "Minimum charge power must not exceed maximum charge power",
-                              details={f'batteries.{i}.c_min': f'{bat.c_min} exceeds c_max {bat.c_max}'})
-                if bat.s_initial > bat.s_capacity:
-                    api.abort(400, "Initial state of charge must not exceed capacity",
-                              details={f'batteries.{i}.s_initial': f'{bat.s_initial} exceeds s_capacity {bat.s_capacity}'})
+            check_batteries(batteries)
 
         except BadRequest:
             raise

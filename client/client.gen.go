@@ -134,6 +134,11 @@ type BatteryConfig struct {
 	//   - False: (default) the device is idle and any charging starts a new session.
 	CActive bool `json:"c_active,omitempty"`
 
+	// CAvail Availability of the device per time step, 1 = available, 0 = away. While away the
+	// device neither charges nor discharges, and s_min, s_max, s_goal and p_demand do not apply.
+	// If not specified the device is available in every step.
+	CAvail []float32 `json:"c_avail,omitempty"`
+
 	// CMax Maximum charge power in W
 	CMax float32 `json:"c_max"`
 
@@ -157,6 +162,11 @@ type BatteryConfig struct {
 	//     subject to the optimization.
 	//   - False: (default) The battery cannot be discharged while power is exported to the grid.
 	DischargeToGrid bool `json:"discharge_to_grid,omitempty"`
+
+	// EAway Energy the device uses away from the charger per time step (Wh), for example driving.
+	// It is taken from the state of charge. Energy the battery cannot hold is reported as a
+	// penalised shortfall instead of making the request infeasible. If not specified it is 0.
+	EAway []float32 `json:"e_away,omitempty"`
 
 	// PA Monetary value of the stored energy per Wh at end of time horizon
 	PA float32 `json:"p_a"`

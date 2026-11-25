@@ -244,6 +244,14 @@ class BatteryConfig:
     s_goal: Optional[List[float]] = None  # Goal state of charge (Wh)
     c_priority: int = 0
     c_active: bool = False  # Whether the device is charging at the start of the horizon
+    c_avail: Optional[List[float]] = None  # 1 if the device is available in a step, 0 if not (missing: always)
+    e_away: Optional[List[float]] = None  # Energy the device uses away from the charger per step (Wh)
+
+    def available(self, t: int) -> bool:
+        return self.c_avail is None or self.c_avail[t] > 0
+
+    def away(self, t: int) -> float:
+        return self.e_away[t] if self.e_away is not None else 0.
 
 
 @dataclass
@@ -281,6 +289,16 @@ HEDGE_TIE_DISCOUNT = 1e-3
 HEDGE_WINDOW = 86400
 
 
+def _without_absent_targets(bat: BatteryConfig) -> BatteryConfig:
+    """Drop the goals and demands of steps the device is away, nothing can charge it there."""
+    if bat.c_avail is None:
+        return bat
+
+    def masked(series):
+        return None if series is None else [v if bat.available(t) else 0. for t, v in enumerate(series)]
+    return replace(bat, s_goal=masked(bat.s_goal), p_demand=masked(bat.p_demand))
+
+
 @cache
 def cbc_takes_mip_start(path: str) -> bool:
     """Whether the CBC binary at path handles a MIP start on a maximization model.
@@ -312,7 +330,7 @@ class Optimizer:
 
         self.strategy = strategy
         self.grid = grid
-        self.batteries = batteries
+        self.batteries = [_without_absent_targets(bat) for bat in batteries]
         self.time_series = time_series
         self.uncertainty = uncertainty or UncertaintyConfig()
         self.circuits = circuits or []
@@ -428,7 +446,7 @@ class Optimizer:
         self.variables['c'] = {}
         for i, bat in enumerate(self.batteries):
             self.variables['c'][i] = [
-                self.problem.add_variable(f"c_{i}_{t}", lowBound=0, upBound=bat.c_max * self.time_series.dt[t] / 3600.)
+                self.problem.add_variable(f"c_{i}_{t}", lowBound=0, upBound=bat.c_max * self.time_series.dt[t] / 3600. * bat.available(t))
                 for t in self.time_steps
             ]
 
@@ -436,7 +454,7 @@ class Optimizer:
         self.variables['d'] = {}
         for i, bat in enumerate(self.batteries):
             self.variables['d'][i] = [
-                self.problem.add_variable(f"d_{i}_{t}", lowBound=0, upBound=bat.d_max * self.time_series.dt[t] / 3600.)
+                self.problem.add_variable(f"d_{i}_{t}", lowBound=0, upBound=bat.d_max * self.time_series.dt[t] / 3600. * bat.available(t))
                 for t in self.time_steps
             ]
 
@@ -475,10 +493,15 @@ class Optimizer:
                         self.variables['z_s_max_reached'][i][t] = self.problem.add_variable(f"z_s_max_reached_{i}_{t}", cat='Binary')
 
         # penalty variable for staying above max SOC and below min SOC
-        self.variables['s_max_pen'] = [[self.problem.add_variable(f"s_max_pen_{i}_{t}", lowBound=0)
-                                        for t in self.time_steps] for i in range(len(self.batteries))]
-        self.variables['s_min_pen'] = [[self.problem.add_variable(f"s_min_pen_{i}_{t}", lowBound=0)
-                                        for t in self.time_steps] for i in range(len(self.batteries))]
+        # an absent device is not held to its limits, its penalties stay at zero
+        self.variables['s_max_pen'] = [[self.problem.add_variable(f"s_max_pen_{i}_{t}", lowBound=0, upBound=None if bat.available(t) else 0)
+                                        for t in self.time_steps] for i, bat in enumerate(self.batteries)]
+        self.variables['s_min_pen'] = [[self.problem.add_variable(f"s_min_pen_{i}_{t}", lowBound=0, upBound=None if bat.available(t) else 0)
+                                        for t in self.time_steps] for i, bat in enumerate(self.batteries)]
+
+        # energy used away from the charger that the battery could not hold, keeps s >= 0 feasible
+        self.variables['s_short'] = [[self.problem.add_variable(f"s_short_{i}_{t}", lowBound=0, upBound=bat.away(t)) if bat.away(t) > 0 else None
+                                      for t in self.time_steps] for i, bat in enumerate(self.batteries)]
 
         # Grid import/export variables [Wh]
         self.variables['n'] = [self.problem.add_variable(f"n_{t}", lowBound=0) for t in self.time_steps]
@@ -589,6 +612,8 @@ class Optimizer:
         for i, bat in enumerate(self.batteries):
             for t in self.time_steps:
                 objective += - self.prc_soc_exc_pen * (self.variables['s_max_pen'][i][t] + self.variables['s_min_pen'][i][t])
+                if self.variables['s_short'][i][t] is not None:
+                    objective += - self.prc_soc_exc_pen * self.variables['s_short'][i][t]
 
         ############################################################################
         # Penalties for goals that cannot be met
@@ -807,6 +832,8 @@ class Optimizer:
         # SOC is reached or max. charing will be forced until min SOC is reached.
         for i, bat in enumerate(self.batteries):
             for t in range(0, self.T):
+                if not bat.available(t):
+                    continue
                 self.problem += (self.variables['s_max_pen'][i][t] >= self.variables['s'][i][t] - bat.s_max)
                 self.problem += (self.variables['s_min_pen'][i][t] >= bat.s_min - self.variables['s'][i][t])
 
@@ -817,14 +844,16 @@ class Optimizer:
                 self.problem += (self.variables['s'][i][0]
                                  == bat.s_initial
                                  + self.eta_c * self.variables['c'][i][0]
-                                 - (1 / self.eta_d) * self.variables['d'][i][0])
+                                 - (1 / self.eta_d) * self.variables['d'][i][0]
+                                 - self._away_from_battery(i, 0))
 
             # State of charge evolution
             for t in range(1, self.T):
                 self.problem += (self.variables['s'][i][t]
                                  == self.variables['s'][i][t - 1]
                                  + self.eta_c * self.variables['c'][i][t]
-                                 - (1 / self.eta_d) * self.variables['d'][i][t])
+                                 - (1 / self.eta_d) * self.variables['d'][i][t]
+                                 - self._away_from_battery(i, t))
 
             # Constraint (6): Battery SOC goal constraints (for t > 0)
             if bat.s_goal is not None:
@@ -836,7 +865,8 @@ class Optimizer:
             # without discharge the room only shrinks, so a rest below c_min fills in one slot.
             # The charger stops once the battery is full, that slot may charge less than c_min.
             # A larger rest splits into slots of c_min to c_max each, so the constant bound suffices.
-            can_discharge = bat.d_max > 0
+            # energy used away from the charger makes room as well
+            can_discharge = bat.d_max > 0 or any(bat.away(t) > 0 for t in self.time_steps)
             rest_to_fill = float('inf') if can_discharge else max(bat.s_max - bat.s_initial, 0.) / self.eta_c
 
             # Constraint: Minimum battery charge demand (for t > 0)
@@ -903,6 +933,11 @@ class Optimizer:
                 self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
                                  * (1 - self.variables['z_cd'][i][t]))
 
+    def _away_from_battery(self, i: int, t: int):
+        """Energy battery i loses to use away from the charger in step t, less what it could not hold."""
+        short = self.variables['s_short'][i][t]
+        return 0 if short is None else self.batteries[i].away(t) - short
+
     def _add_circuit_constraints(self):
         """Limit the charge power sum of the batteries sharing a circuit. Discharging is not counted."""
         for circuit in self.circuits:
@@ -922,7 +957,7 @@ class Optimizer:
         """
         ts = self.time_series
         deviation = self.uncertainty.ft_dev * ts.ft[t] + self.uncertainty.gt_dev * ts.gt[t]
-        spill = ts.ft[t] - ts.gt[t] - sum(bat.c_max for bat in self.batteries) * ts.dt[t] / 3600.
+        spill = ts.ft[t] - ts.gt[t] - sum(bat.c_max for bat in self.batteries if bat.available(t)) * ts.dt[t] / 3600.
         return max(deviation - max(spill, 0), 0)
 
     def _worst_deviation(self) -> np.ndarray:
@@ -993,10 +1028,10 @@ class Optimizer:
             # headroom once a limited request shows a reserve the limit cannot deliver
             self.problem += u_chg <= self.eta_c * self.eta_d * pulp.lpSum(
                 self.batteries[i].c_max * self.time_series.dt[t] / 3600. - self.variables['c'][i][t]
-                for i in reserve_batteries if self.batteries[i].charge_from_grid)
+                for i in reserve_batteries if self.batteries[i].charge_from_grid and self.batteries[i].available(t))
             # stored Wh reach the load at the discharge efficiency
             reserve = self.eta_d * pulp.lpSum(self.variables['s'][i][t] - self.batteries[i].s_min
-                                              + self.variables['s_min_pen'][i][t] for i in reserve_batteries)
+                                              + self.variables['s_min_pen'][i][t] for i in reserve_batteries if self.batteries[i].available(t))
             self.problem += running >= worst[t] - reserve
             self.problem += running <= worst[t]
             # the reserve the worst case consumes instead of importing, what step t adds to it
@@ -1262,8 +1297,13 @@ class Optimizer:
         def count_starts() -> list[int]:
             counts = []
             for i in eligible:
+                bat = self.batteries[i]
                 active = np.array([pulp.value(v) for v in self.variables['c'][i]]) > CONTINUITY_TOLERANCE
-                counts.append(int(np.count_nonzero(active & ~np.r_[self.batteries[i].c_active, active[:-1]])))
+                starts = active & ~np.r_[bat.c_active, active[:-1]]
+                # the first start after the device returns opens a session of its own
+                free = [t for t in np.flatnonzero(starts)
+                        if (gone := [u for u in range(t) if not bat.available(u)]) and not np.any(starts[gone[-1]:t])]
+                counts.append(int(np.count_nonzero(starts)) - len(free))
             return counts
 
         before = count_starts()
@@ -1652,6 +1692,9 @@ class Optimizer:
         for i, bat in enumerate(self.batteries):
             clean_objective += (pulp.value(self.variables['s'][i][self.T-1])
                                 - bat.s_initial) * bat.p_a
+            # energy used away from the charger is consumption, not a loss of the schedule
+            if bat.e_away is not None:
+                clean_objective += sum(pulp.value(self._away_from_battery(i, t)) for t in self.time_steps) * bat.p_a
 
         # charge for import power demand rate. The demand rate is applied to the maximum
         # power draw beyond the threshold within the time horizon.
